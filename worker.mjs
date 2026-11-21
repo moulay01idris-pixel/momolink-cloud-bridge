@@ -27,9 +27,11 @@ const SYSTEM = [
   "ابدأ ردك بكلمة «تم» فقط عند نجاح ما تستطيع فعله فعلاً (الرد/التلخيص/الإجابة).",
 ].join("\n")
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
 function login(appState) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("timeout login")), 90000)
+    const timer = setTimeout(() => reject(new Error("timeout login")), 60000)
     fca({ appState, logging: false }, (err, api) => {
       clearTimeout(timer)
       if (err) reject(err)
@@ -39,7 +41,7 @@ function login(appState) {
 }
 function history(api, threadID, limit) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("timeout history")), 60000)
+    const timer = setTimeout(() => reject(new Error("timeout history")), 45000)
     api.getThreadHistory(threadID, limit, undefined, (err, msgs) => {
       clearTimeout(timer)
       if (err) reject(err)
@@ -47,13 +49,22 @@ function history(api, threadID, limit) {
     })
   })
 }
+function startMqtt(api) {
+  try {
+    const stop = api.listenMqtt(() => {})
+    return stop
+  } catch (e) {
+    console.log("listenMqtt threw: " + String(e?.message || e).slice(0, 120))
+    return null
+  }
+}
 function send(api, threadID, body) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("timeout send")), 60000)
-    api.sendMessage(body, threadID, (err) => {
+    const timer = setTimeout(() => reject(new Error("timeout send")), 45000)
+    api.sendMessage(body, threadID, (err, info) => {
       clearTimeout(timer)
       if (err) reject(err)
-      else resolve()
+      else resolve(info)
     })
   })
 }
@@ -77,7 +88,7 @@ let checkpoint = { lastTimestamp: 0 }
 try {
   checkpoint = JSON.parse(readFileSync(CHECKPOINT, "utf8"))
 } catch {}
-const last = Number(checkpoint.lastTimestamp || 0)
+let last = Number(checkpoint.lastTimestamp || 0)
 
 const api = await login(APPSTATE)
 const ownID = String(api.getCurrentUserID() || "")
@@ -92,18 +103,44 @@ const fresh = msgs
 
 console.log(`thread=${THREAD_ID} own=${ownID} history=${msgs.length} new=${fresh.length} since=${last}`)
 
+// تهيئة MQTT ضرورية لإرسال FCA في هذه النسخة. ننتظر اتصاله قبل الإرسال.
+const stopMqtt = startMqtt(api)
+await sleep(8000)
+
 let newest = last
+let sentCount = 0
 for (const m of fresh) {
-  newest = Math.max(newest, Number(m.timestamp || 0))
+  const ts = Number(m.timestamp || 0)
   try {
     const reply = await askGemini(m.body)
     if (!reply) continue
-    await send(api, THREAD_ID, reply.slice(0, 1800))
-    console.log(`replied to ${m.senderID} ts=${m.timestamp}: ${reply.slice(0, 80).replace(/\n/g, " ")}`)
+    let ok = false
+    for (let attempt = 1; attempt <= 3 && !ok; attempt++) {
+      try {
+        await send(api, THREAD_ID, reply.slice(0, 1800))
+        ok = true
+        sentCount++
+        console.log(`replied to ${m.senderID} ts=${ts}: ${reply.slice(0, 80).replace(/\n/g, " ")}`)
+      } catch (e) {
+        const msg = String(e?.message || e)
+        console.log(`send attempt ${attempt} ts=${ts}: ${msg.slice(0, 140)}`)
+        if (/MQTT client is not initialized|not connected/i.test(msg)) await sleep(5000)
+        else break
+      }
+    }
+    // لا نقدّم الـ checkpoint إلا عند نجاح الإرسال فعلاً.
+    if (ok) newest = Math.max(newest, ts)
   } catch (e) {
-    console.log(`reply error ts=${m.timestamp}: ${String(e?.message || e).slice(0, 160)}`)
+    console.log(`reply error ts=${ts}: ${String(e?.message || e).slice(0, 160)}`)
   }
 }
 
 writeFileSync(CHECKPOINT, JSON.stringify({ lastTimestamp: newest, updatedAt: new Date().toISOString() }, null, 2))
-console.log(`checkpoint=${newest}`)
+console.log(`checkpoint=${newest} sent=${sentCount} pending=${fresh.length - sentCount}`)
+
+try {
+  if (typeof stopMqtt === "function") stopMqtt()
+  else if (typeof api.stopListening === "function") api.stopListening()
+} catch {}
+// FCA يترك مؤقتات MQTT مفتوحة؛ خروج صريح لتفادي تعليق الوظيفة حتى المهلة.
+process.exit(0)
