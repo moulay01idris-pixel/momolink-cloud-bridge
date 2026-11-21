@@ -1,0 +1,47 @@
+name: MoMoLink Cloud Bridge
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: momolink-cloud-bridge
+  cancel-in-progress: false
+
+jobs:
+  bridge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Run cloud bridge worker
+        env:
+          FB_APPSTATE: ${{ secrets.FB_APPSTATE }}
+          GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
+          TARGET_THREAD_ID: ${{ vars.TARGET_THREAD_ID || '1618729240054631' }}
+        run: node worker.mjs
+
+      - name: Persist checkpoint
+        run: |
+          git config user.name "cloud-bridge"
+          git config user.email "cloud-bridge@users.noreply.github.com"
+          git add checkpoint.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update message checkpoint"
+            git push
+          fi
