@@ -1,6 +1,6 @@
-// عامل الجسر السحابي — يعمل داخل GitHub Actions بلا حاسوب المستخدم.
-// يقرأ رسائل «momo cod» من متصفح حقيقي بالكوكيز، ويولّد رداً بـ Gemini، ويرسله.
-// لا ينفّذ أوامر محلية: الحاسوب قد يكون مطفأً.
+// عامل الجسر السحابي — يعمل في GitHub Actions بلا حاسوب المستخدم.
+// الافتراضي: السحابة ترد أولاً. بأمر من المستخدم يتحول الرد للمحلي،
+// وإن تعذّر المحلي (حاسوب مطفأ/متوقف) يرجع السحابة تلقائياً.
 import { readFileSync, writeFileSync } from "node:fs"
 import puppeteer from "puppeteer-core"
 
@@ -8,35 +8,47 @@ const APPSTATE = JSON.parse(process.env.FB_APPSTATE || "null")
 const GEMINI_KEY = (process.env.GEMINI_KEY || "").trim()
 const THREAD_ID = (process.env.TARGET_THREAD_ID || "1618729240054631").trim()
 const CHECKPOINT = process.env.CHECKPOINT_FILE || "checkpoint.json"
+const MODE_FILE = process.env.MODE_FILE || "mode.json"
 const MAX_MESSAGES = Number(process.env.MAX_MESSAGES || 3)
 const MODEL = process.env.GEMINI_MODEL || "gemini-flash-lite-latest"
 const CHROME_PATH = process.env.CHROME_PATH || "/usr/bin/google-chrome"
 const PRIME_ONLY = process.env.PRIME_ONLY === "1"
-const HEADLESS = process.env.HEADLESS !== "false"
+const FAILOVER_AFTER_MS = Number(process.env.FAILOVER_AFTER_MS || 120000)
 
 if (!Array.isArray(APPSTATE) || !APPSTATE.length) throw new Error("FB_APPSTATE مفقود أو فارغ")
 if (!GEMINI_KEY && !PRIME_ONLY) throw new Error("GEMINI_KEY مفقود")
+
+// أوامر التحويل: صيغة قصيرة صارمة لتفادي تحويل الوضع بكلام عابر.
+const CMD_LOCAL = /^\s*\/?\s*(محلي|local|تحول\s+للمحلي|انتقل\s+للمحلي|حول\s+للمحلي|شغل\s+المحلي|شغّل\s+المحلي|فعّل\s+المحلي|تفعيل\s+المحلي)\s*[.!؟]?\s*$/i
+const CMD_CLOUD = /^\s*\/?\s*(سحابي|cloud|تحول\s+للسحابي|انتقل\s+للسحابي|حول\s+للسحابي|شغل\s+السحابي|شغّل\s+السحابي|فعّل\s+السحابي|تفعيل\s+السحابي|ارجع\s+للسحابي|السحابة)\s*[.!؟]?\s*$/i
 
 const SYSTEM = [
   "أنت جسر سحابي يعمل في السحابة ولا يملك حاسوب المستخدم؛ قد يكون حاسوبه مطفأً.",
   "أنت متصل بمجموعة فيسبوك «momo cod». أجب بالعربية وباختصار شديد.",
   "لا تدّعِ أبداً أنك فتحت برنامجاً أو أنشأت ملفاً أو نفّذت أمراً على حاسوب المستخدم.",
   "إن طلب المستخدم تنفيذ شيء محلي، قل بوضوح إن التنفيذ المحلي يحتاج تشغيل الجسر المحلي على حاسوبه.",
+  "إن سُئلت عن أوامر التحويل: أرسل «محلي» لتحويل الرد للجسر المحلي، أو «سحابي» للعودة للسحابة.",
   "ابدأ ردك بكلمة «تم» فقط عند نجاح ما تستطيع فعله فعلاً (الرد/التلخيص/الإجابة).",
 ].join("\n")
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+function loadJson(path, fallback) {
+  try { return JSON.parse(readFileSync(path, "utf8")) } catch { return fallback }
+}
 function loadCheckpoint() {
-  try {
-    const d = JSON.parse(readFileSync(CHECKPOINT, "utf8"))
-    return { primed: !!d.primed, seenKeys: Array.isArray(d.seenKeys) ? d.seenKeys.map(String) : [] }
-  } catch {
-    return { primed: false, seenKeys: [] }
-  }
+  const d = loadJson(CHECKPOINT, {})
+  return { primed: !!d.primed, seenKeys: Array.isArray(d.seenKeys) ? d.seenKeys.map(String) : [] }
 }
 function saveCheckpoint(cp) {
   writeFileSync(CHECKPOINT, JSON.stringify({ ...cp, updatedAt: new Date().toISOString() }, null, 2))
+}
+function loadMode() {
+  const d = loadJson(MODE_FILE, {})
+  return { mode: d.mode === "local" ? "local" : "cloud", since: Number(d.since || 0) }
+}
+function saveMode(mode) {
+  writeFileSync(MODE_FILE, JSON.stringify({ mode, since: mode === "local" ? Date.now() : 0, updatedAt: new Date().toISOString() }, null, 2))
 }
 
 async function askGemini(text) {
@@ -56,7 +68,7 @@ async function askGemini(text) {
 
 const browser = await puppeteer.launch({
   executablePath: CHROME_PATH,
-  headless: HEADLESS,
+  headless: true,
   args: [
     "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
     "--no-first-run", "--no-default-browser-check",
@@ -137,7 +149,6 @@ try {
       if (/^(chats|marketplace|requests|archive|active now|messenger|skip to|compose|write a message)/i.test(text)) continue
       if (/^end-to-end encrypted messages restored|^message not restored|^you (deleted|sent) a message/i.test(text)) continue
       const sm = label.match(/\bby\s+(You|[^:]+?)\s*(?::|$)/i)
-      // إن وُجد رد من "You" بعد هذه الرسالة في الترتيب، فالجسر المحلي ردّ عليها بالفعل.
       const answered = all.slice(idx + 1).some((x) => x.own)
       seen.add(key)
       out.push({ key: key.slice(0, 500), text, sender: sm ? norm(sm[1]) : "", answered })
@@ -147,7 +158,68 @@ try {
   const unique = [...new Map(messages.map((m) => [m.key, m])).values()]
   console.log("messages=" + unique.length)
 
+  const composerSel = '[role="textbox"][contenteditable="true"][aria-label^="Write to"], [role="textbox"][contenteditable="true"], [contenteditable="true"]'
+  async function sendReply(text) {
+    await page.evaluate((sel) => { const el = document.querySelector(sel); if (el) el.focus() }, composerSel).catch(() => {})
+    await page.keyboard.down("Control"); await page.keyboard.press("KeyA"); await page.keyboard.up("Control"); await page.keyboard.press("Backspace")
+    const lines = String(text).replace(/\r\n/g, "\n").split("\n").slice(0, 20)
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) { await page.keyboard.down("Shift"); await page.keyboard.press("Enter"); await page.keyboard.up("Shift") }
+      if (lines[i]) await page.keyboard.type(lines[i].slice(0, 1800), { delay: 1 })
+    }
+    const handle = await page.evaluateHandle(() => {
+      for (const s of ['[aria-label*="Send"]', '[aria-label*="إرسال"]']) {
+        const el = document.querySelector(s); if (el) return el
+      }
+      return null
+    })
+    const sendBtn = handle.asElement?.()
+    if (sendBtn) await sendBtn.click().catch(() => {})
+    await sleep(600)
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const left = await page.evaluate((sel) => String(document.querySelector(sel)?.innerText || "").trim(), composerSel).catch(() => "")
+      if (!left) break
+      await page.keyboard.press("Enter")
+      await sleep(700)
+    }
+    const needle = String(text).split("\n")[0].replace(/\s+/g, " ").trim().slice(0, 20)
+    for (let k = 0; k < 12; k++) {
+      const ok = await page.evaluate((n) =>
+        Array.from(document.querySelectorAll('[role="article"]')).some((el) => {
+          const label = String(el.getAttribute("aria-label") || "").replace(/\s+/g, " ")
+          return /by\s+You\b/i.test(label) && label.includes(n)
+        }), needle).catch(() => false)
+      if (ok) return true
+      await sleep(900)
+    }
+    const empty = await page.evaluate((sel) => !String(document.querySelector(sel)?.innerText || "").trim(), composerSel).catch(() => false)
+    if (empty) { console.log("delivery-assumed-by-empty-composer"); return true }
+    return false
+  }
+
   const cp = loadCheckpoint()
+  let modeState = loadMode()
+  let mode = modeState.mode
+  console.log(`mode=${mode}`)
+
+  // أوامر التحويل تُعالج من أي رسالة حديثة (حت لو ردّ المحلي عليها قبلاً).
+  const toLocal = unique.find((m) => CMD_LOCAL.test(m.text))
+  const toCloud = unique.find((m) => CMD_CLOUD.test(m.text))
+  if (toLocal && mode !== "local") {
+    saveMode("local")
+    cp.seenKeys.push(toLocal.key); cp.seenKeys = cp.seenKeys.slice(-300); saveCheckpoint(cp)
+    await sendReply("تم. تحوّل الرد إلى الجسر المحلي. تأكد من تشغيل الحاسوب؛ إن لم يرد خلال دقيقتين سأعود للسحابة تلقائياً.")
+    console.log("mode=local by-command")
+    process.exit(0)
+  }
+  if (toCloud && mode !== "cloud") {
+    saveMode("cloud")
+    cp.seenKeys.push(toCloud.key); cp.seenKeys = cp.seenKeys.slice(-300); saveCheckpoint(cp)
+    await sendReply("تم. عدنا إلى الجسر السحابي.")
+    console.log("mode=cloud by-command")
+    process.exit(0)
+  }
+
   if (PRIME_ONLY || !cp.primed) {
     cp.primed = true
     cp.seenKeys = unique.map((m) => m.key).slice(-300)
@@ -156,60 +228,30 @@ try {
     if (PRIME_ONLY) process.exit(0)
   }
 
-  const fresh = unique.filter((m) => !m.answered && !cp.seenKeys.includes(m.key)).slice(-MAX_MESSAGES)
+  let fresh = unique.filter((m) => !m.answered && !cp.seenKeys.includes(m.key))
   const skippedAnswered = unique.filter((m) => m.answered && !cp.seenKeys.includes(m.key)).length
   console.log(`fresh=${fresh.length} skipped_already_answered=${skippedAnswered}`)
 
+  if (mode === "local") {
+    const since = Number(modeState.since || 0)
+    if (!fresh.length || (since && Date.now() - since < FAILOVER_AFTER_MS)) {
+      console.log("standby-cloud: local mode active")
+      process.exit(0)
+    }
+    // رسائل بلا رد → المحلي متعطل؛ رجوع تلقائي للسحابة.
+    saveMode("cloud")
+    console.log("failover-to-cloud reason=local-no-reply")
+  }
+
+  fresh = fresh.slice(-MAX_MESSAGES)
   let sent = 0
   for (const m of fresh) {
     try {
       const reply = await askGemini(m.text)
       if (!reply) continue
-      const composerSel = '[role="textbox"][contenteditable="true"][aria-label^="Write to"], [role="textbox"][contenteditable="true"], [contenteditable="true"]'
-      await page.evaluate((sel) => { const el = document.querySelector(sel); if (el) el.focus() }, composerSel).catch(() => {})
-      await page.keyboard.down("Control"); await page.keyboard.press("KeyA"); await page.keyboard.up("Control"); await page.keyboard.press("Backspace")
-      const lines = String(reply).replace(/\r\n/g, "\n").split("\n").slice(0, 20)
-      for (let i = 0; i < lines.length; i++) {
-        if (i > 0) { await page.keyboard.down("Shift"); await page.keyboard.press("Enter"); await page.keyboard.up("Shift") }
-        if (lines[i]) await page.keyboard.type(lines[i].slice(0, 1800), { delay: 1 })
-      }
-      const handle = await page.evaluateHandle(() => {
-        for (const s of ['[aria-label*="Send"]', '[aria-label*="إرسال"]']) {
-          const el = document.querySelector(s); if (el) return el
-        }
-        return null
-      })
-      const sendBtn = handle.asElement?.()
-      if (sendBtn) await sendBtn.click().catch(() => {})
-      await sleep(600)
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const left = await page.evaluate((sel) => String(document.querySelector(sel)?.innerText || "").trim(), composerSel).catch(() => "")
-        if (!left) break
-        await page.keyboard.press("Enter")
-        await sleep(700)
-      }
-      const needle = String(reply).split("\n")[0].replace(/\s+/g, " ").trim().slice(0, 20)
-      let delivered = false
-      // ماسنجر يحتفظ بنافذة ثابتة من الرسائل (15)، لذا لا يكفي عدّ رسائل "You"؛
-      // نبحث عن نص الرد نفسه في aria-label وننتظر حتى يظهر.
-      for (let k = 0; k < 12; k++) {
-        delivered = await page.evaluate((n) =>
-          Array.from(document.querySelectorAll('[role="article"]')).some((el) => {
-            const label = String(el.getAttribute("aria-label") || "").replace(/\s+/g, " ")
-            return /by\s+You\b/i.test(label) && label.includes(n)
-          }), needle).catch(() => false)
-        if (delivered) break
-        await sleep(900)
-      }
-      // إن تعذّر العثور على النص لكن الحقل فَرَغ، فالإرسال نجح غالباً (لا نُعيد الرد).
-      if (!delivered) {
-        const empty = await page.evaluate((sel) => !String(document.querySelector(sel)?.innerText || "").trim(), composerSel).catch(() => false)
-        if (empty) { delivered = true; console.log("delivery-assumed-by-empty-composer") }
-      }
-      if (!delivered) throw new Error("delivery-not-confirmed")
-      cp.seenKeys.push(m.key)
-      cp.seenKeys = cp.seenKeys.slice(-300)
-      saveCheckpoint(cp)
+      const ok = await sendReply(reply)
+      if (!ok) throw new Error("delivery-not-confirmed")
+      cp.seenKeys.push(m.key); cp.seenKeys = cp.seenKeys.slice(-300); saveCheckpoint(cp)
       sent++
       console.log("replied=" + m.sender + " text=" + m.text.slice(0, 60).replace(/\n/g, " "))
     } catch (e) {
@@ -220,5 +262,4 @@ try {
   console.log(`done sent=${sent} pending=${fresh.length - sent}`)
 } finally {
   try { await browser.close() } catch {}
-  if (!PRIME_ONLY) process.exit(0)
 }
