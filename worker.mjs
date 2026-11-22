@@ -118,11 +118,14 @@ try {
       if (usable.length !== 1) return ""
       return norm(usable[0])
     }
+    const all = Array.from(document.querySelectorAll('[role="article"]')).map((el) => ({
+      el, label: labelOf(el), own: isOwn(el),
+    }))
     const out = []
     const seen = new Set()
-    for (const el of document.querySelectorAll('[role="article"]')) {
-      if (isOwn(el)) continue
-      const label = labelOf(el)
+    for (let idx = 0; idx < all.length; idx++) {
+      const { el, label, own } = all[idx]
+      if (own) continue
       const key = label || "txt:" + norm(el.innerText || el.textContent || "")
       if (seen.has(key)) continue
       let text = textOf(el)
@@ -134,8 +137,10 @@ try {
       if (/^(chats|marketplace|requests|archive|active now|messenger|skip to|compose|write a message)/i.test(text)) continue
       if (/^end-to-end encrypted messages restored|^message not restored|^you (deleted|sent) a message/i.test(text)) continue
       const sm = label.match(/\bby\s+(You|[^:]+?)\s*(?::|$)/i)
+      // إن وُجد رد من "You" بعد هذه الرسالة في الترتيب، فالجسر المحلي ردّ عليها بالفعل.
+      const answered = all.slice(idx + 1).some((x) => x.own)
       seen.add(key)
-      out.push({ key: key.slice(0, 500), text, sender: sm ? norm(sm[1]) : "" })
+      out.push({ key: key.slice(0, 500), text, sender: sm ? norm(sm[1]) : "", answered })
     }
     return out
   })
@@ -151,8 +156,9 @@ try {
     if (PRIME_ONLY) process.exit(0)
   }
 
-  const fresh = unique.filter((m) => !cp.seenKeys.includes(m.key)).slice(-MAX_MESSAGES)
-  console.log("fresh=" + fresh.length)
+  const fresh = unique.filter((m) => !m.answered && !cp.seenKeys.includes(m.key)).slice(-MAX_MESSAGES)
+  const skippedAnswered = unique.filter((m) => m.answered && !cp.seenKeys.includes(m.key)).length
+  console.log(`fresh=${fresh.length} skipped_already_answered=${skippedAnswered}`)
 
   let sent = 0
   for (const m of fresh) {
