@@ -1,13 +1,8 @@
 // عامل الجسر السحابي — يعمل داخل GitHub Actions بلا حاسوب المستخدم.
-// يقرأ رسائل مجموعة «momo cod» عبر FCA، ويولّد رداً بـ Gemini المجاني، ويرسله.
+// يقرأ رسائل «momo cod» من متصفح حقيقي بالكوكيز، ويولّد رداً بـ Gemini، ويرسله.
 // لا ينفّذ أوامر محلية: الحاسوب قد يكون مطفأً.
 import { readFileSync, writeFileSync } from "node:fs"
-import { createRequire } from "node:module"
-import path from "node:path"
-
-const require = createRequire(import.meta.url)
-const FCA_PATH = path.resolve(process.cwd(), "node_modules", "@dongdev", "fca-unofficial", "dist", "cjs.cjs")
-const fca = require(FCA_PATH)
+import puppeteer from "puppeteer-core"
 
 const APPSTATE = JSON.parse(process.env.FB_APPSTATE || "null")
 const GEMINI_KEY = (process.env.GEMINI_KEY || "").trim()
@@ -15,9 +10,12 @@ const THREAD_ID = (process.env.TARGET_THREAD_ID || "1618729240054631").trim()
 const CHECKPOINT = process.env.CHECKPOINT_FILE || "checkpoint.json"
 const MAX_MESSAGES = Number(process.env.MAX_MESSAGES || 3)
 const MODEL = process.env.GEMINI_MODEL || "gemini-flash-lite-latest"
+const CHROME_PATH = process.env.CHROME_PATH || "/usr/bin/google-chrome"
+const PRIME_ONLY = process.env.PRIME_ONLY === "1"
+const HEADLESS = process.env.HEADLESS !== "false"
 
 if (!Array.isArray(APPSTATE) || !APPSTATE.length) throw new Error("FB_APPSTATE مفقود أو فارغ")
-if (!GEMINI_KEY) throw new Error("GEMINI_KEY مفقود")
+if (!GEMINI_KEY && !PRIME_ONLY) throw new Error("GEMINI_KEY مفقود")
 
 const SYSTEM = [
   "أنت جسر سحابي يعمل في السحابة ولا يملك حاسوب المستخدم؛ قد يكون حاسوبه مطفأً.",
@@ -29,44 +27,16 @@ const SYSTEM = [
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
-function login(appState) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("timeout login")), 60000)
-    fca({ appState, logging: false }, (err, api) => {
-      clearTimeout(timer)
-      if (err) reject(err)
-      else resolve(api)
-    })
-  })
-}
-function history(api, threadID, limit) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("timeout history")), 45000)
-    api.getThreadHistory(threadID, limit, undefined, (err, msgs) => {
-      clearTimeout(timer)
-      if (err) reject(err)
-      else resolve(Array.isArray(msgs) ? msgs : [])
-    })
-  })
-}
-function startMqtt(api) {
+function loadCheckpoint() {
   try {
-    const stop = api.listenMqtt(() => {})
-    return stop
-  } catch (e) {
-    console.log("listenMqtt threw: " + String(e?.message || e).slice(0, 120))
-    return null
+    const d = JSON.parse(readFileSync(CHECKPOINT, "utf8"))
+    return { primed: !!d.primed, seenKeys: Array.isArray(d.seenKeys) ? d.seenKeys.map(String) : [] }
+  } catch {
+    return { primed: false, seenKeys: [] }
   }
 }
-function send(api, threadID, body) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("timeout send")), 45000)
-    api.sendMessage(body, threadID, (err, info) => {
-      clearTimeout(timer)
-      if (err) reject(err)
-      else resolve(info)
-    })
-  })
+function saveCheckpoint(cp) {
+  writeFileSync(CHECKPOINT, JSON.stringify({ ...cp, updatedAt: new Date().toISOString() }, null, 2))
 }
 
 async function askGemini(text) {
@@ -84,63 +54,109 @@ async function askGemini(text) {
   return String(data?.choices?.[0]?.message?.content || "").trim()
 }
 
-let checkpoint = { lastTimestamp: 0 }
+const browser = await puppeteer.launch({
+  executablePath: CHROME_PATH,
+  headless: HEADLESS,
+  args: [
+    "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+    "--no-first-run", "--no-default-browser-check",
+    "--disable-blink-features=AutomationControlled",
+  ],
+  defaultViewport: { width: 1366, height: 768 },
+})
+
 try {
-  checkpoint = JSON.parse(readFileSync(CHECKPOINT, "utf8"))
-} catch {}
-let last = Number(checkpoint.lastTimestamp || 0)
+  const page = await browser.newPage()
+  await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36")
+  const cookies = APPSTATE.filter((c) => /facebook\.com/.test(c.domain || "")).map((c) => ({
+    name: c.name, value: c.value, domain: c.domain, path: c.path || "/",
+    secure: c.secure !== false, httpOnly: !!c.httpOnly,
+    ...(c.expires && c.expires > 0 ? { expires: c.expires } : {}),
+  }))
+  await page.setCookie(...cookies)
+  await page.goto(`https://www.facebook.com/t/${THREAD_ID}/`, { waitUntil: "domcontentloaded", timeout: 90000 })
+  await sleep(9000)
 
-const api = await login(APPSTATE)
-const ownID = String(api.getCurrentUserID() || "")
-const msgs = await history(api, THREAD_ID, 30)
-const fresh = msgs
-  .filter((m) => Number(m.timestamp || 0) > last)
-  .filter((m) => String(m.senderID || "") !== ownID)
-  .filter((m) => String(m.body || "").trim())
-  .filter((m) => !/^⏳|^تم تشغيل الجسر|^\✅/.test(String(m.body || "").trim()))
-  .sort((a, b) => Number(a.timestamp) - Number(b.timestamp))
-  .slice(-MAX_MESSAGES)
+  const state = await page.evaluate(() => ({
+    url: location.href,
+    loginForm: !!document.querySelector('input[name="email"], input[name="pass"]'),
+    title: String(document.title || "").slice(0, 80),
+    articles: document.querySelectorAll('[role="article"]').length,
+    composer: !!document.querySelector('[role="textbox"][contenteditable="true"]'),
+  }))
+  console.log("browser-state=" + JSON.stringify(state))
+  if (state.loginForm || /login|checkpoint|two_step/i.test(state.url)) throw new Error("FACEBOOK_NOT_LOGGED_IN")
+  if (!state.articles) throw new Error("NO_MESSAGES_FOUND")
 
-console.log(`thread=${THREAD_ID} own=${ownID} history=${msgs.length} new=${fresh.length} since=${last}`)
-
-// تهيئة MQTT ضرورية لإرسال FCA في هذه النسخة. ننتظر اتصاله قبل الإرسال.
-const stopMqtt = startMqtt(api)
-await sleep(8000)
-
-let newest = last
-let sentCount = 0
-for (const m of fresh) {
-  const ts = Number(m.timestamp || 0)
-  try {
-    const reply = await askGemini(m.body)
-    if (!reply) continue
-    let ok = false
-    for (let attempt = 1; attempt <= 3 && !ok; attempt++) {
-      try {
-        await send(api, THREAD_ID, reply.slice(0, 1800))
-        ok = true
-        sentCount++
-        console.log(`replied to ${m.senderID} ts=${ts}: ${reply.slice(0, 80).replace(/\n/g, " ")}`)
-      } catch (e) {
-        const msg = String(e?.message || e)
-        console.log(`send attempt ${attempt} ts=${ts}: ${msg.slice(0, 140)}`)
-        if (/MQTT client is not initialized|not connected/i.test(msg)) await sleep(5000)
-        else break
-      }
+  const messages = await page.evaluate(() => {
+    const norm = (s) => String(s || "").replace(/\s+/g, " ").trim()
+    const out = []
+    for (const el of document.querySelectorAll('[role="article"]')) {
+      let label = norm(el.getAttribute("aria-label") || "")
+      const inner = el.querySelector('[aria-label*="Message sent"]')
+      if (!label && inner) label = norm(inner.getAttribute("aria-label") || "")
+      const m = label.match(/\bMessage sent\b[^:]*\bby\s+(You|[^:]+?)\s*:\s*([\s\S]+)$/i)
+      if (!m) continue
+      const sender = norm(m[1])
+      if (/^you$/i.test(sender)) continue
+      const text = norm(m[2])
+      if (!text || text.length > 3000) continue
+      out.push({ key: label.slice(0, 400), text, sender })
     }
-    // لا نقدّم الـ checkpoint إلا عند نجاح الإرسال فعلاً.
-    if (ok) newest = Math.max(newest, ts)
-  } catch (e) {
-    console.log(`reply error ts=${ts}: ${String(e?.message || e).slice(0, 160)}`)
+    return out
+  })
+  const unique = [...new Map(messages.map((m) => [m.key, m])).values()]
+  console.log("messages=" + unique.length)
+
+  const cp = loadCheckpoint()
+  if (PRIME_ONLY || !cp.primed) {
+    cp.primed = true
+    cp.seenKeys = unique.map((m) => m.key).slice(-300)
+    saveCheckpoint(cp)
+    console.log("primed=" + cp.seenKeys.length)
+    if (PRIME_ONLY) process.exit(0)
   }
+
+  const fresh = unique.filter((m) => !cp.seenKeys.includes(m.key)).slice(-MAX_MESSAGES)
+  console.log("fresh=" + fresh.length)
+
+  let sent = 0
+  for (const m of fresh) {
+    try {
+      const reply = await askGemini(m.text)
+      if (!reply) continue
+      const ok = await page.evaluate((t) => {
+        const el =
+          document.querySelector('[role="textbox"][contenteditable="true"][aria-label^="Write to"]') ||
+          document.querySelector('[role="textbox"][contenteditable="true"]') ||
+          document.querySelector('[contenteditable="true"]')
+        if (!el) return false
+        el.focus()
+        document.execCommand("insertText", false, t)
+        return String(el.innerText || "").trim().length > 0
+      }, reply.slice(0, 1800))
+      if (!ok) throw new Error("composer-fill-failed")
+      await sleep(300)
+      await page.keyboard.press("Enter")
+      await sleep(2500)
+      const delivered = await page.evaluate((t) => {
+        const needle = String(t || "").replace(/\s+/g, " ").trim().slice(0, 40)
+        return Array.from(document.querySelectorAll('[role="article"]'))
+          .some((el) => /by You/i.test(el.getAttribute("aria-label") || "") && (el.getAttribute("aria-label") || "").includes(needle))
+      }, reply.slice(0, 1800))
+      if (!delivered) throw new Error("delivery-not-confirmed")
+      cp.seenKeys.push(m.key)
+      cp.seenKeys = cp.seenKeys.slice(-300)
+      saveCheckpoint(cp)
+      sent++
+      console.log("replied=" + m.sender + " text=" + m.text.slice(0, 60).replace(/\n/g, " "))
+    } catch (e) {
+      console.log("reply-error=" + String(e?.message || e).slice(0, 160))
+    }
+  }
+  saveCheckpoint(cp)
+  console.log(`done sent=${sent} pending=${fresh.length - sent}`)
+} finally {
+  try { await browser.close() } catch {}
+  if (!PRIME_ONLY) process.exit(0)
 }
-
-writeFileSync(CHECKPOINT, JSON.stringify({ lastTimestamp: newest, updatedAt: new Date().toISOString() }, null, 2))
-console.log(`checkpoint=${newest} sent=${sentCount} pending=${fresh.length - sentCount}`)
-
-try {
-  if (typeof stopMqtt === "function") stopMqtt()
-  else if (typeof api.stopListening === "function") api.stopListening()
-} catch {}
-// FCA يترك مؤقتات MQTT مفتوحة؛ خروج صريح لتفادي تعليق الوظيفة حتى المهلة.
-process.exit(0)
