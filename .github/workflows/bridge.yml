@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      prime:
+        description: "Seed current messages without replying"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -15,7 +20,7 @@ concurrency:
 jobs:
   bridge:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,14 +33,28 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
+      - name: Locate Chrome
+        id: chrome
+        run: |
+          CANDIDATE="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || true)"
+          if [ -z "$CANDIDATE" ]; then
+            echo "::error::No Chrome/Chromium binary found on runner"
+            exit 1
+          fi
+          echo "path=$CANDIDATE" >> "$GITHUB_OUTPUT"
+          echo "Using browser: $CANDIDATE"
+
       - name: Run cloud bridge worker
         env:
           FB_APPSTATE: ${{ secrets.FB_APPSTATE }}
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
           TARGET_THREAD_ID: ${{ vars.TARGET_THREAD_ID || '1618729240054631' }}
+          CHROME_PATH: ${{ steps.chrome.outputs.path }}
+          PRIME_ONLY: ${{ inputs.prime && '1' || '0' }}
         run: node worker.mjs
 
       - name: Persist checkpoint
+        if: always()
         run: |
           git config user.name "cloud-bridge"
           git config user.email "cloud-bridge@users.noreply.github.com"
