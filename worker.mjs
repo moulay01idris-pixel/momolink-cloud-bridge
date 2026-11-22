@@ -160,10 +160,6 @@ try {
       const reply = await askGemini(m.text)
       if (!reply) continue
       const composerSel = '[role="textbox"][contenteditable="true"][aria-label^="Write to"], [role="textbox"][contenteditable="true"], [contenteditable="true"]'
-      const countYou = () => page.evaluate(() =>
-        Array.from(document.querySelectorAll('[role="article"]'))
-          .filter((el) => /by\s+You\b/i.test(el.getAttribute("aria-label") || "")).length)
-      const beforeCount = await countYou()
       await page.evaluate((sel) => { const el = document.querySelector(sel); if (el) el.focus() }, composerSel).catch(() => {})
       await page.keyboard.down("Control"); await page.keyboard.press("KeyA"); await page.keyboard.up("Control"); await page.keyboard.press("Backspace")
       const lines = String(reply).replace(/\r\n/g, "\n").split("\n").slice(0, 20)
@@ -186,8 +182,24 @@ try {
         await page.keyboard.press("Enter")
         await sleep(700)
       }
-      await sleep(1500)
-      const delivered = (await countYou()) > beforeCount
+      const needle = String(reply).split("\n")[0].replace(/\s+/g, " ").trim().slice(0, 20)
+      let delivered = false
+      // ماسنجر يحتفظ بنافذة ثابتة من الرسائل (15)، لذا لا يكفي عدّ رسائل "You"؛
+      // نبحث عن نص الرد نفسه في aria-label وننتظر حتى يظهر.
+      for (let k = 0; k < 12; k++) {
+        delivered = await page.evaluate((n) =>
+          Array.from(document.querySelectorAll('[role="article"]')).some((el) => {
+            const label = String(el.getAttribute("aria-label") || "").replace(/\s+/g, " ")
+            return /by\s+You\b/i.test(label) && label.includes(n)
+          }), needle).catch(() => false)
+        if (delivered) break
+        await sleep(900)
+      }
+      // إن تعذّر العثور على النص لكن الحقل فَرَغ، فالإرسال نجح غالباً (لا نُعيد الرد).
+      if (!delivered) {
+        const empty = await page.evaluate((sel) => !String(document.querySelector(sel)?.innerText || "").trim(), composerSel).catch(() => false)
+        if (empty) { delivered = true; console.log("delivery-assumed-by-empty-composer") }
+      }
       if (!delivered) throw new Error("delivery-not-confirmed")
       cp.seenKeys.push(m.key)
       cp.seenKeys = cp.seenKeys.slice(-300)
