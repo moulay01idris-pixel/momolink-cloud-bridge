@@ -89,19 +89,53 @@ try {
   if (!state.articles) throw new Error("NO_MESSAGES_FOUND")
 
   const messages = await page.evaluate(() => {
-    const norm = (s) => String(s || "").replace(/\s+/g, " ").trim()
-    const out = []
-    for (const el of document.querySelectorAll('[role="article"]')) {
+    const norm = (s) => String(s || "").replace(/\r/g, "").trim()
+    const NOISE = /^(Aa|press enter to send|write a message|loading messages|announcement:|end-to-end encrypted messages restored|compose|message requests|active now|chat history is missing|enter your pin|forgot pin|messages and calls are secured)/i
+    const senders = new Set()
+    for (const el of document.querySelectorAll('[aria-label*="Message sent"]')) {
+      const mm = norm(el.getAttribute("aria-label") || "").match(/\bby\s+(You|[^:]+?)\s*:/i)
+      if (mm) senders.add(norm(mm[1]))
+    }
+    const labelOf = (el) => {
       let label = norm(el.getAttribute("aria-label") || "")
-      const inner = el.querySelector('[aria-label*="Message sent"]')
-      if (!label && inner) label = norm(inner.getAttribute("aria-label") || "")
-      const m = label.match(/\bMessage sent\b[^:]*\bby\s+(You|[^:]+?)\s*:\s*([\s\S]+)$/i)
-      if (!m) continue
-      const sender = norm(m[1])
-      if (/^you$/i.test(sender)) continue
-      const text = norm(m[2])
-      if (!text || text.length > 3000) continue
-      out.push({ key: label.slice(0, 400), text, sender })
+      if (!/\bmessage sent\b/i.test(label)) {
+        const child = el.querySelector('[aria-label*="Message sent"], [aria-label*="by You"]')
+        if (child) label = norm(child.getAttribute("aria-label") || "")
+      }
+      return label
+    }
+    const isOwn = (el) => /\bby\s+You\b(?=\s*:|$)/i.test(labelOf(el))
+    const textOf = (el) => {
+      const m = labelOf(el).match(/\bby\s+(You|[^:]+?)\s*:\s*([\s\S]+)$/i)
+      if (m) {
+        const body = norm(m[2])
+        if (!body || NOISE.test(body) || senders.has(body)) return ""
+        return body
+      }
+      const lines = norm(el.innerText || el.textContent || "").split("\n").map((s) => s.trim()).filter(Boolean)
+      const META = /you sent|message sent|by you|loading|announcement|enter,|\bAM\b|\bPM\b|\d{1,2}:\d{2}|october|november|december/i
+      const usable = lines.filter((s) => s.length > 2 && !META.test(s) && !NOISE.test(s) && !senders.has(s))
+      if (usable.length !== 1) return ""
+      return norm(usable[0])
+    }
+    const out = []
+    const seen = new Set()
+    for (const el of document.querySelectorAll('[role="article"]')) {
+      if (isOwn(el)) continue
+      const label = labelOf(el)
+      const key = label || "txt:" + norm(el.innerText || el.textContent || "")
+      if (seen.has(key)) continue
+      let text = textOf(el)
+      if (!text) {
+        const inner = el.querySelector('[aria-label*="Message sent"], [aria-label*="by You"]')
+        if (inner) text = textOf(inner)
+      }
+      if (!text || text.length > 3000 || senders.has(text)) continue
+      if (/^(chats|marketplace|requests|archive|active now|messenger|skip to|compose|write a message)/i.test(text)) continue
+      if (/^end-to-end encrypted messages restored|^message not restored|^you (deleted|sent) a message/i.test(text)) continue
+      const sm = label.match(/\bby\s+(You|[^:]+?)\s*(?::|$)/i)
+      seen.add(key)
+      out.push({ key: key.slice(0, 500), text, sender: sm ? norm(sm[1]) : "" })
     }
     return out
   })
@@ -125,25 +159,35 @@ try {
     try {
       const reply = await askGemini(m.text)
       if (!reply) continue
-      const ok = await page.evaluate((t) => {
-        const el =
-          document.querySelector('[role="textbox"][contenteditable="true"][aria-label^="Write to"]') ||
-          document.querySelector('[role="textbox"][contenteditable="true"]') ||
-          document.querySelector('[contenteditable="true"]')
-        if (!el) return false
-        el.focus()
-        document.execCommand("insertText", false, t)
-        return String(el.innerText || "").trim().length > 0
-      }, reply.slice(0, 1800))
-      if (!ok) throw new Error("composer-fill-failed")
-      await sleep(300)
-      await page.keyboard.press("Enter")
-      await sleep(2500)
-      const delivered = await page.evaluate((t) => {
-        const needle = String(t || "").replace(/\s+/g, " ").trim().slice(0, 40)
-        return Array.from(document.querySelectorAll('[role="article"]'))
-          .some((el) => /by You/i.test(el.getAttribute("aria-label") || "") && (el.getAttribute("aria-label") || "").includes(needle))
-      }, reply.slice(0, 1800))
+      const composerSel = '[role="textbox"][contenteditable="true"][aria-label^="Write to"], [role="textbox"][contenteditable="true"], [contenteditable="true"]'
+      const countYou = () => page.evaluate(() =>
+        Array.from(document.querySelectorAll('[role="article"]'))
+          .filter((el) => /by\s+You\b/i.test(el.getAttribute("aria-label") || "")).length)
+      const beforeCount = await countYou()
+      await page.evaluate((sel) => { const el = document.querySelector(sel); if (el) el.focus() }, composerSel).catch(() => {})
+      await page.keyboard.down("Control"); await page.keyboard.press("KeyA"); await page.keyboard.up("Control"); await page.keyboard.press("Backspace")
+      const lines = String(reply).replace(/\r\n/g, "\n").split("\n").slice(0, 20)
+      for (let i = 0; i < lines.length; i++) {
+        if (i > 0) { await page.keyboard.down("Shift"); await page.keyboard.press("Enter"); await page.keyboard.up("Shift") }
+        if (lines[i]) await page.keyboard.type(lines[i].slice(0, 1800), { delay: 1 })
+      }
+      const handle = await page.evaluateHandle(() => {
+        for (const s of ['[aria-label*="Send"]', '[aria-label*="إرسال"]']) {
+          const el = document.querySelector(s); if (el) return el
+        }
+        return null
+      })
+      const sendBtn = handle.asElement?.()
+      if (sendBtn) await sendBtn.click().catch(() => {})
+      await sleep(600)
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const left = await page.evaluate((sel) => String(document.querySelector(sel)?.innerText || "").trim(), composerSel).catch(() => "")
+        if (!left) break
+        await page.keyboard.press("Enter")
+        await sleep(700)
+      }
+      await sleep(1500)
+      const delivered = (await countYou()) > beforeCount
       if (!delivered) throw new Error("delivery-not-confirmed")
       cp.seenKeys.push(m.key)
       cp.seenKeys = cp.seenKeys.slice(-300)
