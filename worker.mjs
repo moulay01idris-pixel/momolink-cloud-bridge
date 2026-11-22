@@ -19,8 +19,8 @@ if (!Array.isArray(APPSTATE) || !APPSTATE.length) throw new Error("FB_APPSTATE �
 if (!GEMINI_KEY && !PRIME_ONLY) throw new Error("GEMINI_KEY مفقود")
 
 // أوامر التحويل: صيغة قصيرة صارمة لتفادي تحويل الوضع بكلام عابر.
-const CMD_LOCAL = /^\s*\/?\s*(محلي|local|تحول\s+للمحلي|انتقل\s+للمحلي|حول\s+للمحلي|شغل\s+المحلي|شغّل\s+المحلي|فعّل\s+المحلي|تفعيل\s+المحلي)\s*[.!؟]?\s*$/i
-const CMD_CLOUD = /^\s*\/?\s*(سحابي|cloud|تحول\s+للسحابي|انتقل\s+للسحابي|حول\s+للسحابي|شغل\s+السحابي|شغّل\s+السحابي|فعّل\s+السحابي|تفعيل\s+السحابي|ارجع\s+للسحابي|السحابة)\s*[.!؟]?\s*$/i
+const CMD_LOCAL = /^\s*\/?\s*(محلي|local|تحول\s+للمحلي|انتقل\s+للمحلي|حول\s+للمحلي|شغل\s+المحلي|شغّل\s+المحلي|فعّل\s+المحلي|تفعيل\s+المحلي|فع[ّ]?ل\s+الجسر\s+محلي|فع[ّ]?ل\s+الجسر\s+المحلي|شغ[ّ]?ل\s+الجسر\s+محلي|شغ[ّ]?ل\s+الجسر\s+المحلي|الجسر\s+المحلي|فع[ّ]?ل\s+الجسر\s+فيسبوك|شغ[ّ]?ل\s+الجسر\s+فيسبوك|الجسر\s+الفيسبوكي)\s*[.!؟]?\s*$/i
+const CMD_CLOUD = /^\s*\/?\s*(سحابي|cloud|تحول\s+للسحابي|انتقل\s+للسحابي|حول\s+للسحابي|شغل\s+السحابي|شغّل\s+السحابي|فعّل\s+السحابي|تفعيل\s+السحابي|ارجع\s+للسحابي|السحابة|فع[ّ]?ل\s+الجسر\s+سحابي|فع[ّ]?ل\s+الجسر\s+السحابي|شغ[ّ]?ل\s+الجسر\s+سحابي|شغ[ّ]?ل\s+الجسر\s+السحابي|الجسر\s+السحابي)\s*[.!؟]?\s*$/i
 
 const SYSTEM = [
   "أنت جسر سحابي يعمل في السحابة ولا يملك حاسوب المستخدم؛ قد يكون حاسوبه مطفأً.",
@@ -235,12 +235,11 @@ try {
   if (mode === "local") {
     const since = Number(modeState.since || 0)
     if (!fresh.length || (since && Date.now() - since < FAILOVER_AFTER_MS)) {
-      console.log("standby-cloud: local mode active")
+      console.log("standby-cloud: local active")
       process.exit(0)
     }
-    // رسائل بلا رد → المحلي متعطل؛ رجوع تلقائي للسحابة.
-    saveMode("cloud")
-    console.log("failover-to-cloud reason=local-no-reply")
+    // المحلي هو الردّ الأساس؛ السحابة ترد كاحتياط فقط دون تغيير الوضع.
+    console.log("backup-cloud-reply reason=local-no-reply (mode stays local)")
   }
 
   fresh = fresh.slice(-MAX_MESSAGES)
