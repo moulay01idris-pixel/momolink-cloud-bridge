@@ -86,8 +86,15 @@ try {
     ...(c.expires && c.expires > 0 ? { expires: c.expires } : {}),
   }))
   await page.setCookie(...cookies)
-  await page.goto(`https://www.facebook.com/t/${THREAD_ID}/`, { waitUntil: "domcontentloaded", timeout: 90000 })
+  // فيسبوك أوقف عرض المسار المباشر /t/<id>/ على الويب (يعيد "Page isn't available").
+  // المسار الصحيح هو /messages/t/<id>/، مع /t/ كاحتياط فقط.
+  await page.goto(`https://www.facebook.com/messages/t/${THREAD_ID}/`, { waitUntil: "domcontentloaded", timeout: 90000 })
   await sleep(9000)
+  const firstProbe = await page.evaluate(() => document.querySelectorAll('[role="article"]').length).catch(() => 0)
+  if (!firstProbe) {
+    await page.goto(`https://www.facebook.com/t/${THREAD_ID}/`, { waitUntil: "domcontentloaded", timeout: 90000 }).catch(() => {})
+    await sleep(6000)
+  }
 
   const state = await page.evaluate(() => ({
     url: location.href,
@@ -95,10 +102,11 @@ try {
     title: String(document.title || "").slice(0, 80),
     articles: document.querySelectorAll('[role="article"]').length,
     composer: !!document.querySelector('[role="textbox"][contenteditable="true"]'),
+    body: String(document.body?.innerText || "").slice(0, 160).replace(/\s+/g, " "),
   }))
   console.log("browser-state=" + JSON.stringify(state))
   if (state.loginForm || /login|checkpoint|two_step/i.test(state.url)) throw new Error("FACEBOOK_NOT_LOGGED_IN")
-  if (!state.articles) throw new Error("NO_MESSAGES_FOUND")
+  if (!state.articles) throw new Error("NO_MESSAGES_FOUND body=" + state.body)
 
   const messages = await page.evaluate(() => {
     const norm = (s) => String(s || "").replace(/\r/g, "").trim()
