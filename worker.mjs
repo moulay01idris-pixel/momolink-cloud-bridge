@@ -18,6 +18,31 @@ const FAILOVER_AFTER_MS = Number(process.env.FAILOVER_AFTER_MS || 120000)
 if (!Array.isArray(APPSTATE) || !APPSTATE.length) throw new Error("FB_APPSTATE مفقود أو فارغ")
 if (!GEMINI_KEY && !PRIME_ONLY) throw new Error("GEMINI_KEY مفقود")
 
+// فحص مبكر: لا داعي لإقلاع متصفح بجلسة منتهية.
+function writeHealth(status, detail = "", articles = 0) {
+  try {
+    writeFileSync("health.json", JSON.stringify({
+      at: new Date().toISOString(), status, articles, detail: String(detail).slice(0, 240),
+    }, null, 2))
+  } catch {}
+}
+function cookieFault(list) {
+  const now = Date.now() / 1000
+  for (const k of ["xs", "c_user"]) {
+    const c = list.find((x) => (x.name || x.key) === k)
+    if (!c) return "COOKIE_MISSING:" + k
+    const exp = Number(c.expirationDate || c.expires || 0)
+    if (exp && exp < now) return "COOKIE_EXPIRED:" + k
+  }
+  return ""
+}
+const fault = cookieFault(APPSTATE)
+if (fault) {
+  console.log(fault + " — يجب تحديث FB_APPSTATE")
+  writeHealth(fault)
+  process.exit(78)
+}
+
 // أوامر التحويل: صيغة قصيرة صارمة لتفادي تحويل الوضع بكلام عابر.
 const CMD_LOCAL = /^\s*\/?\s*(محلي|local|تحول\s+للمحلي|انتقل\s+للمحلي|حول\s+للمحلي|شغل\s+المحلي|شغّل\s+المحلي|فعّل\s+المحلي|تفعيل\s+المحلي|فع[ّ]?ل\s+الجسر\s+محلي|فع[ّ]?ل\s+الجسر\s+المحلي|شغ[ّ]?ل\s+الجسر\s+محلي|شغ[ّ]?ل\s+الجسر\s+المحلي|الجسر\s+المحلي|فع[ّ]?ل\s+الجسر\s+فيسبوك|شغ[ّ]?ل\s+الجسر\s+فيسبوك|الجسر\s+الفيسبوكي)\s*[.!؟]?\s*$/i
 const CMD_CLOUD = /^\s*\/?\s*(سحابي|cloud|تحول\s+للسحابي|انتقل\s+للسحابي|حول\s+للسحابي|شغل\s+السحابي|شغّل\s+السحابي|فعّل\s+السحابي|تفعيل\s+السحابي|ارجع\s+للسحابي|السحابة|فع[ّ]?ل\s+الجسر\s+سحابي|فع[ّ]?ل\s+الجسر\s+السحابي|شغ[ّ]?ل\s+الجسر\s+سحابي|شغ[ّ]?ل\s+الجسر\s+السحابي|الجسر\s+السحابي)\s*[.!؟]?\s*$/i
@@ -86,27 +111,47 @@ try {
     ...(c.expires && c.expires > 0 ? { expires: c.expires } : {}),
   }))
   await page.setCookie(...cookies)
-  // فيسبوك أوقف عرض المسار المباشر /t/<id>/ على الويب (يعيد "Page isn't available").
-  // المسار الصحيح هو /messages/t/<id>/، مع /t/ كاحتياط فقط.
-  await page.goto(`https://www.facebook.com/messages/t/${THREAD_ID}/`, { waitUntil: "domcontentloaded", timeout: 90000 })
-  await sleep(9000)
-  const firstProbe = await page.evaluate(() => document.querySelectorAll('[role="article"]').length).catch(() => 0)
-  if (!firstProbe) {
-    await page.goto(`https://www.facebook.com/t/${THREAD_ID}/`, { waitUntil: "domcontentloaded", timeout: 90000 }).catch(() => {})
-    await sleep(6000)
-  }
-
-  const state = await page.evaluate(() => ({
+  // فيسبوك أوقف عرض المسار المباشر /t/<id>/ — نبدأ من /messages/t/<id>/.
+  const navigate = (path) =>
+    page.goto(`https://www.facebook.com${path}`, { waitUntil: "domcontentloaded", timeout: 90000 }).catch(() => {})
+  const snapshot = () => page.evaluate(() => ({
     url: location.href,
     loginForm: !!document.querySelector('input[name="email"], input[name="pass"]'),
+    checkpoint: /checkpoint|two_step|help\/contact/i.test(location.href),
     title: String(document.title || "").slice(0, 80),
     articles: document.querySelectorAll('[role="article"]').length,
     composer: !!document.querySelector('[role="textbox"][contenteditable="true"]'),
     body: String(document.body?.innerText || "").slice(0, 160).replace(/\s+/g, " "),
   }))
+
+  let state = null
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await navigate(attempt === 3 ? `/t/${THREAD_ID}/` : `/messages/t/${THREAD_ID}/`)
+    // انتظار ذكي: نخرج فور ظهور الرسائل بدل نوم ثابت.
+    for (let i = 0; i < 90; i++) {
+      state = await snapshot().catch(() => null)
+      if (state?.articles || state?.loginForm || state?.checkpoint) break
+      await sleep(500)
+    }
+    if (state?.articles) break
+    console.log(`nav-retry=${attempt} articles=${state?.articles || 0} title=${state?.title || ""}`)
+    await sleep(1500)
+  }
+  state = state || { url: "", articles: 0, body: "" }
   console.log("browser-state=" + JSON.stringify(state))
-  if (state.loginForm || /login|checkpoint|two_step/i.test(state.url)) throw new Error("FACEBOOK_NOT_LOGGED_IN")
-  if (!state.articles) throw new Error("NO_MESSAGES_FOUND body=" + state.body)
+  if (state.loginForm) {
+    writeHealth("SESSION_EXPIRED", state.body)
+    throw new Error("SESSION_EXPIRED — " + state.body)
+  }
+  if (state.checkpoint || /login|checkpoint|two_step/i.test(state.url)) {
+    writeHealth("CHECKPOINT_REQUIRED", state.body)
+    throw new Error("CHECKPOINT_REQUIRED — " + state.body)
+  }
+  if (!state.articles) {
+    const why = /isn't available|not available/i.test(state.body) ? "THREAD_UNREACHABLE" : "NO_MESSAGES_FOUND"
+    writeHealth(why, state.body, 0)
+    throw new Error(why + " — " + state.body)
+  }
 
   const messages = await page.evaluate(() => {
     const norm = (s) => String(s || "").replace(/\r/g, "").trim()
@@ -244,6 +289,7 @@ try {
     const since = Number(modeState.since || 0)
     if (!fresh.length || (since && Date.now() - since < FAILOVER_AFTER_MS)) {
       console.log("standby-cloud: local active")
+      writeHealth("STANDBY_LOCAL_ACTIVE", "", state.articles)
       process.exit(0)
     }
     // المحلي هو الردّ الأساس؛ السحابة ترد كاحتياط فقط دون تغيير الوضع.
@@ -267,6 +313,7 @@ try {
   }
   saveCheckpoint(cp)
   console.log(`done sent=${sent} pending=${fresh.length - sent}`)
+  writeHealth(sent ? "REPLIED" : "HEALTHY", `sent=${sent}`, state.articles)
 } finally {
   try { await browser.close() } catch {}
 }
