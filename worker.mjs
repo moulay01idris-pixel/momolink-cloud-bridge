@@ -13,7 +13,6 @@ const MAX_MESSAGES = Number(process.env.MAX_MESSAGES || 3)
 const MODEL = process.env.GEMINI_MODEL || "gemini-flash-lite-latest"
 const CHROME_PATH = process.env.CHROME_PATH || "/usr/bin/google-chrome"
 const PRIME_ONLY = process.env.PRIME_ONLY === "1"
-const FAILOVER_AFTER_MS = Number(process.env.FAILOVER_AFTER_MS || 120000)
 
 if (!Array.isArray(APPSTATE) || !APPSTATE.length) throw new Error("FB_APPSTATE مفقود أو فارغ")
 if (!GEMINI_KEY && !PRIME_ONLY) throw new Error("GEMINI_KEY مفقود")
@@ -22,7 +21,9 @@ if (!GEMINI_KEY && !PRIME_ONLY) throw new Error("GEMINI_KEY مفقود")
 function writeHealth(status, detail = "", articles = 0) {
   try {
     writeFileSync("health.json", JSON.stringify({
-      at: new Date().toISOString(), status, articles, detail: String(detail).slice(0, 240),
+      // الريبو عام: لا نكتب نصوص المحادثة ولا أي بيانات تعريفية في health.json.
+      at: new Date().toISOString(), status, articles,
+      detail: String(detail).replace(/[^\x20-\x7E]/g, "").slice(0, 120),
     }, null, 2))
   } catch {}
 }
@@ -121,7 +122,7 @@ try {
     title: String(document.title || "").slice(0, 80),
     articles: document.querySelectorAll('[role="article"]').length,
     composer: !!document.querySelector('[role="textbox"][contenteditable="true"]'),
-    body: String(document.body?.innerText || "").slice(0, 160).replace(/\s+/g, " "),
+    // لا نُخرج نص الصفحة: السجلات في ريبو عام.
   }))
 
   let state = null
@@ -140,17 +141,17 @@ try {
   state = state || { url: "", articles: 0, body: "" }
   console.log("browser-state=" + JSON.stringify(state))
   if (state.loginForm) {
-    writeHealth("SESSION_EXPIRED", state.body)
-    throw new Error("SESSION_EXPIRED — " + state.body)
+    writeHealth("SESSION_EXPIRED")
+    throw new Error("SESSION_EXPIRED — FB_APPSTATE يجب تحديثه")
   }
   if (state.checkpoint || /login|checkpoint|two_step/i.test(state.url)) {
-    writeHealth("CHECKPOINT_REQUIRED", state.body)
-    throw new Error("CHECKPOINT_REQUIRED — " + state.body)
+    writeHealth("CHECKPOINT_REQUIRED")
+    throw new Error("CHECKPOINT_REQUIRED — أكمل التحقق في المتصفح")
   }
   if (!state.articles) {
-    const why = /isn't available|not available/i.test(state.body) ? "THREAD_UNREACHABLE" : "NO_MESSAGES_FOUND"
-    writeHealth(why, state.body, 0)
-    throw new Error(why + " — " + state.body)
+    const why = state.title ? "NO_MESSAGES_FOUND" : "THREAD_UNREACHABLE"
+    writeHealth(why, "", 0)
+    throw new Error(why + " — لم يُعرض أي role=article")
   }
 
   const messages = await page.evaluate(() => {
@@ -258,17 +259,28 @@ try {
   // أوامر التحويل تُعالج من أي رسالة حديثة (حت لو ردّ المحلي عليها قبلاً).
   const toLocal = unique.find((m) => CMD_LOCAL.test(m.text))
   const toCloud = unique.find((m) => CMD_CLOUD.test(m.text))
+  // لا نغيّر الوضع إلا بعد نجاح الإرسال (rats: فشل الإرسال ≠ أمر منفًّذ).
   if (toLocal && mode !== "local") {
+    const ok = await sendReply("تم. تحوّل الرد إلى الجسر المحلي. تأكد من تشغيل الحاسوب.")
+    if (!ok) {
+      console.log("mode-switch-ack-failed local")
+      writeHealth("ACK_FAILED")
+      process.exit(1)
+    }
     saveMode("local")
     cp.seenKeys.push(toLocal.key); cp.seenKeys = cp.seenKeys.slice(-300); saveCheckpoint(cp)
-    await sendReply("تم. تحوّل الرد إلى الجسر المحلي. تأكد من تشغيل الحاسوب؛ إن لم يرد خلال دقيقتين سأعود للسحابة تلقائياً.")
     console.log("mode=local by-command")
     process.exit(0)
   }
   if (toCloud && mode !== "cloud") {
+    const ok = await sendReply("تم. عدنا إلى الجسر السحابي.")
+    if (!ok) {
+      console.log("mode-switch-ack-failed cloud")
+      writeHealth("ACK_FAILED")
+      process.exit(1)
+    }
     saveMode("cloud")
     cp.seenKeys.push(toCloud.key); cp.seenKeys = cp.seenKeys.slice(-300); saveCheckpoint(cp)
-    await sendReply("تم. عدنا إلى الجسر السحابي.")
     console.log("mode=cloud by-command")
     process.exit(0)
   }
@@ -286,14 +298,11 @@ try {
   console.log(`fresh=${fresh.length} skipped_already_answered=${skippedAnswered}`)
 
   if (mode === "local") {
-    const since = Number(modeState.since || 0)
-    if (!fresh.length || (since && Date.now() - since < FAILOVER_AFTER_MS)) {
-      console.log("standby-cloud: local active")
-      writeHealth("STANDBY_LOCAL_ACTIVE", "", state.articles)
-      process.exit(0)
-    }
-    // المحلي هو الردّ الأساس؛ السحابة ترد كاحتياط فقط دون تغيير الوضع.
-    console.log("backup-cloud-reply reason=local-no-reply (mode stays local)")
+    // المحلي هو الردّ الأساس. لا نستخدم since كدليل على توقفه (كان يسبب ردوداً مكررة
+    // بعد دقيقتين حتى لو كان المحلي حياً). العودة للسحابة تتم بأمر صريح «سحابي».
+    console.log("standby-cloud: local active (no duplicate replies)")
+    writeHealth("STANDBY_LOCAL_ACTIVE", "", state.articles)
+    process.exit(0)
   }
 
   fresh = fresh.slice(-MAX_MESSAGES)
@@ -306,7 +315,8 @@ try {
       if (!ok) throw new Error("delivery-not-confirmed")
       cp.seenKeys.push(m.key); cp.seenKeys = cp.seenKeys.slice(-300); saveCheckpoint(cp)
       sent++
-      console.log("replied=" + m.sender + " text=" + m.text.slice(0, 60).replace(/\n/g, " "))
+      // لا نطبع اسم المُرسل ولا نص رسالته (السجلات عامة).
+      console.log("replied=1")
     } catch (e) {
       console.log("reply-error=" + String(e?.message || e).slice(0, 160))
     }
