@@ -67,8 +67,10 @@ jobs:
           git add checkpoint.json mode.json health.json 2>/dev/null || true
           if ! git diff --cached --quiet; then
             git commit -m "chore: update checkpoint/health" || true
-            git push || true
           fi
+          # تفادي رفض الـ push عند تزامن تشغيلين: ادمج قبل الدفع.
+          git pull --rebase origin main || true
+          git push || true
 
       - name: Continue chain (~5 min)
         if: always() && vars.REPO_DISABLE_AUTO_LOOP != 'true'
@@ -77,7 +79,7 @@ jobs:
         run: |
           echo "chain: sleeping 240s before next run"
           sleep 240
-          gh api repos/${{ github.repository }}/actions/workflows/${{ github.workflow }}/dispatches \
+          gh api repos/${{ github.repository }}/actions/workflows/bridge.yml/dispatches \
             -f ref=${{ github.ref_name }} \
             -f inputs='{"prime": false, "chain": true}'
           echo "chain: next run dispatched"
