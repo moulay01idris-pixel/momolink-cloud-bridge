@@ -94,7 +94,7 @@ async function askGemini(text) {
 
 const browser = await puppeteer.launch({
   executablePath: CHROME_PATH,
-  headless: true,
+  headless: process.env.HEADLESS !== "0",
   args: [
     "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
     "--no-first-run", "--no-default-browser-check",
@@ -254,6 +254,12 @@ try {
   const cp = loadCheckpoint()
   let modeState = loadMode()
   let mode = modeState.mode
+  // إن توقّف نبض الحاسوب (مطفأ/بدون شبكة) أكثر من 15 دقيقة، تتولّى السحابة الرد تلقائياً.
+  const staleMs = Number(process.env.LOCAL_STALE_MIN || 15) * 60 * 1000
+  if (mode === "local" && modeState.since && Date.now() - Number(modeState.since) > staleMs) {
+    mode = "cloud"
+    console.log("standby-expired: local heartbeat stale -> cloud takeover")
+  }
   console.log(`mode=${mode}`)
 
   // أوامر التحويل تُعالج من أي رسالة حديثة (حت لو ردّ المحلي عليها قبلاً).
