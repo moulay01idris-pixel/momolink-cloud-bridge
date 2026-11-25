@@ -1,6 +1,6 @@
 {
-  "at": "2026-11-25T12:45:02.408Z",
-  "status": "STANDBY_LOCAL_ACTIVE",
+  "at": "2026-11-25T12:51:56.865Z",
+  "status": "THREAD_UNREACHABLE",
   "articles": 0,
   "detail": ""
 }
