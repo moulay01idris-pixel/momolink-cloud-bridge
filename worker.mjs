@@ -92,6 +92,20 @@ async function askGemini(text) {
   return String(data?.choices?.[0]?.message?.content || "").trim()
 }
 
+// الحاسوب شغّال؟ لا نفتح فيسبوك من السحابة إطلاقاً.
+// كل فتح للجلسة نفسها من عنوان IP مختلف يرفع خطر إبطال كوكيز فيسبوك
+// (وهذا ما حدث حين كان المحلي والسحابة يقرآن المحادثة في الوقت نفسه).
+{
+  const early = loadMode()
+  const staleMs0 = Number(process.env.LOCAL_STALE_MIN || 15) * 60 * 1000
+  const localAlive = early.mode === "local" && early.since && Date.now() - Number(early.since) <= staleMs0
+  if (localAlive) {
+    console.log("mode=local standby-skip: no Facebook access while PC is online")
+    writeHealth("STANDBY_LOCAL_ACTIVE", "", 0)
+    process.exit(0)
+  }
+}
+
 const browser = await puppeteer.launch({
   executablePath: CHROME_PATH,
   headless: process.env.HEADLESS !== "0",
