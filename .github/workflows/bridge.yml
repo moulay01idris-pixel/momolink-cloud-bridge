@@ -39,25 +39,25 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
-      - name: Locate Chrome
+      - name: Setup Chrome
         id: chrome
-        run: |
-          CANDIDATE="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || true)"
-          if [ -z "$CANDIDATE" ]; then
-            echo "::error::No Chrome/Chromium binary found on runner"
-            exit 1
-          fi
-          echo "path=$CANDIDATE" >> "$GITHUB_OUTPUT"
-          echo "Using browser: $CANDIDATE"
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Setup Xvfb
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
 
       - name: Run cloud bridge worker
         env:
           FB_APPSTATE: ${{ secrets.FB_APPSTATE }}
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
           TARGET_THREAD_ID: ${{ vars.TARGET_THREAD_ID || '1618729240054631' }}
-          CHROME_PATH: ${{ steps.chrome.outputs.path }}
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          HEADLESS: "0"
+          LOCAL_STALE_MIN: "15"
           PRIME_ONLY: ${{ inputs.prime && '1' || '0' }}
-        run: node worker.mjs
+        run: xvfb-run -a node worker.mjs
 
       - name: Persist checkpoint + health
         if: always()
